@@ -5820,6 +5820,7 @@ struct FailoverRestartRequest {
 };
 
 static FailoverRestartRequest g_failoverRestart;
+static bool g_restartUsedSpeedPack = false;
 static std::string g_failoverPromptStorage;
 static std::string g_failoverRatiosStorage;
 static std::vector<std::string> g_failoverHostStorage;
@@ -5834,22 +5835,6 @@ void failoverArmSessionRestart(const std::string &prompt, NnUint steps, NnUint n
     std::printf("🔁 [failover] session-restart armed steps=%u layers=%u promptBytes=%zu\n",
         (unsigned)steps, (unsigned)nLayers, prompt.size());
     std::fflush(stdout);
-}
-
-static std::string evenPpRatios(NnUint nNodes, NnUint nLayers) {
-    std::ostringstream out;
-    const NnUint base = nNodes == 0u ? 0u : nLayers / nNodes;
-    NnUint rem = nNodes == 0u ? 0u : nLayers % nNodes;
-    NnUint cursor = 0u;
-    for (NnUint i = 0; i < nNodes; ++i) {
-        const NnUint count = base + (rem > 0u ? 1u : 0u);
-        if (rem > 0u) --rem;
-        if (i > 0u) out << '*';
-        out << "1@" << count;
-        cursor += count;
-    }
-    (void)cursor;
-    return out.str();
 }
 
 struct SpeedDeviceProfile {
@@ -6040,9 +6025,13 @@ static void applyFailoverRestart(AppCliArgs *args) {
     args->workerPorts = g_failoverPorts.empty() ? nullptr : g_failoverPorts.data();
     if (args->nWorkers == 0u || g_failoverRestart.nLayers == 0u) {
         args->ratiosStr = nullptr;
+        g_restartUsedSpeedPack = false;
     } else {
-        g_failoverRatiosStorage = evenPpRatios(args->nWorkers + 1u, g_failoverRestart.nLayers);
-        args->ratiosStr = const_cast<char *>(g_failoverRatiosStorage.c_str());
+        g_failoverRatiosStorage = speedPackRatios(args, g_failoverRestart.nLayers, nullptr);
+        args->ratiosStr = g_failoverRatiosStorage.empty()
+            ? nullptr
+            : const_cast<char *>(g_failoverRatiosStorage.c_str());
+        g_restartUsedSpeedPack = args->ratiosStr != nullptr;
     }
     std::printf("🔁 [failover] session-restart workers=%u ratios=%s\n",
         (unsigned)args->nWorkers, args->ratiosStr == nullptr ? "(single)" : args->ratiosStr);
@@ -6136,10 +6125,11 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
         autoRatiosStorage = speedPackRatios(args, header.nLayers, &g_poolLive);
         if (!autoRatiosStorage.empty())
             args->ratiosStr = const_cast<char *>(autoRatiosStorage.c_str());
-    } else if (args->ratiosStr != nullptr) {
+    } else if (args->ratiosStr != nullptr && !g_restartUsedSpeedPack) {
         std::printf("⚖️  [manual-ratios] ratios=%s\n", args->ratiosStr);
         std::fflush(stdout);
     }
+    g_restartUsedSpeedPack = false;
 
     if(args->ratiosStr != nullptr){
         printf("nNodes=%d\n", nNodes);
