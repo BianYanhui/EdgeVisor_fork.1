@@ -195,6 +195,7 @@ typedef struct {
     NnUint layerBegin;
     NnUint layerEnd;
     NnUint peerPort;
+    char peerHost[64];
 } LlmDeviceJoinPacket;
 
 static constexpr NnUint LLM_BATCH_META_MAGIC = 0x4d54424du; // 'MBTM' little-endian

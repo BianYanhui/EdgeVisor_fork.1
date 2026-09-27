@@ -47,7 +47,10 @@ public:
 
 // Returns true when the dead node's layers were already covered and the local
 // plan now skips that stage. The target node also enables those redundant layers.
-typedef bool (*NnPpFailoverFn)(NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint deadNodeIndex);
+// replayActivation is set only for the send that just failed, so the dead layers
+// are applied to that in-flight activation. An idle detect passes false and must
+// not run those layers on the previous token.
+typedef bool (*NnPpFailoverFn)(NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint deadNodeIndex, bool replayActivation);
 void setNnPpFailoverHook(NnPpFailoverFn fn);
 void nnSetAcceptTimeoutMs(int timeoutMs);
 bool probeWorkerReachable(const char *host, int port, int timeoutMs);

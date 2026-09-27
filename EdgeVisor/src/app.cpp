@@ -1508,7 +1508,7 @@ static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNod
         std::vector<NnStageDef> stages;
         stages.reserve(parts.size());
         for (const auto& seg : parts) {
-            NnStageDef st;
+            NnStageDef st{};
             st.nLayers = 0;
             auto parsed = parseRatiosAndMaybeLayers(seg);
             st.tpRatios = std::move(parsed.first);
@@ -1564,7 +1564,7 @@ static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNod
         stages.reserve(nStages);
         for (size_t i = 0; i < nStages; ++i) {
             const std::string& seg = parts[1 + i];
-            NnStageDef st;
+            NnStageDef st{};
             st.nLayers = 0;
             auto parsed = parseRatiosAndMaybeLayers(seg);
             st.tpRatios = std::move(parsed.first);
@@ -5525,12 +5525,17 @@ bool WorkerLlmInference::tryReadControlPacket() {
                 const NnUint me = localNodeIndex - 1u;
                 const NnUint peer = pkt.workerIndex;
                 const int peerPort = (int)pkt.peerPort;
+                bool installed = false;
                 if (me < peer) {
-                    std::thread([net, me, peer, peerPort]() {
-                        net->connectAndInstallPeer(me, peer, "127.0.0.1", peerPort);
-                    }).detach();
+                    if (pkt.peerHost[0] != '\0')
+                        installed = net->connectAndInstallPeer(me, peer, pkt.peerHost, peerPort);
                 } else {
-                    std::thread([net, me, peer]() { net->acceptAndInstallPeer(me, peer); }).detach();
+                    installed = net->acceptAndInstallPeer(me, peer);
+                }
+                if (!installed) {
+                    std::printf("⚠️  [pool] worker %u failed to install peer %u\n",
+                        (unsigned)me, (unsigned)peer);
+                    std::fflush(stdout);
                 }
                 network->writeAck(ROOT_SOCKET_INDEX);
             } else {
@@ -5692,9 +5697,22 @@ void WorkerLlmInference::flushPendingKvAck() {
 
 static NnExecutor *g_failoverExecutor = nullptr;
 
+struct ArmedTakeover {
+    bool armed = false;
+    bool layersEnabled = false;
+    NnUint ownerNode = 0u;
+    NnUint begin = 0u;
+    NnUint end = 0u;
+};
+
+static ArmedTakeover g_armedTakeover;
+
 struct FailoverExecGuard {
     NnExecutor *executor;
-    explicit FailoverExecGuard(NnExecutor *executor) : executor(executor) { g_failoverExecutor = executor; }
+    explicit FailoverExecGuard(NnExecutor *executor) : executor(executor) {
+        g_failoverExecutor = executor;
+        g_armedTakeover = ArmedTakeover();
+    }
     ~FailoverExecGuard() { if (g_failoverExecutor == executor) g_failoverExecutor = nullptr; }
 };
 
@@ -5706,23 +5724,21 @@ static bool ppStageCoversLayers(const RuntimeStageLayerPlan &roles, NnUint stage
     return true;
 }
 
-// A holds a non-empty prefix of the dead range and C holds the rest.
-// Overlap is allowed: the split is the first layer A does not cover, and C
-// must cover every layer from there to the end.
-static bool ppBilateralSplit(const RuntimeStageLayerPlan &roles, NnUint prev, NnUint next,
-                             NnUint begin, NnUint end, NnUint *splitOut) {
-    if (begin >= end || splitOut == nullptr) return false;
-    NnUint split = begin;
-    while (split < end && roles.getRole(prev, split) == RUNTIME_LAYER_REDUNDANT) ++split;
-    if (split == begin || split == end) return false;
-    for (NnUint layer = split; layer < end; ++layer) {
-        if (roles.getRole(next, layer) != RUNTIME_LAYER_REDUNDANT) return false;
+static void enableArmedTakeoverLayers(bool replayActivation) {
+    if (g_failoverExecutor == nullptr || !g_armedTakeover.armed) return;
+    if (!g_armedTakeover.layersEnabled) {
+        for (NnUint layer = g_armedTakeover.begin; layer < g_armedTakeover.end; ++layer)
+            g_failoverExecutor->setRedundantLayerEnabled(layer, true);
+        g_armedTakeover.layersEnabled = true;
+        // The in-flight send already copied the pre-takeover activation out.
+        // Run the dead layers on that snapshot once, then the retry sends it.
+        // Later tokens run the same layers inside the normal forward.
+        if (replayActivation)
+            g_failoverExecutor->spliceRedundantLayersIntoSend(g_armedTakeover.begin, g_armedTakeover.end);
     }
-    *splitOut = split;
-    return true;
 }
 
-static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint deadNodeIndex) {
+static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeIndex, NnUint deadNodeIndex, bool replayActivation) {
     if (plan == nullptr || plan->stages == nullptr) return false;
     NnUint stageIndex = (NnUint)-1;
     for (NnUint s = 0; s < plan->nStages; ++s) {
@@ -5731,10 +5747,20 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
             break;
         }
     }
-    if (stageIndex == (NnUint)-1) return false;
+    if (stageIndex == (NnUint)-1) {
+        if (!g_armedTakeover.armed) return false;
+        if (myNodeIndex == g_armedTakeover.ownerNode)
+            enableArmedTakeoverLayers(replayActivation);
+        std::printf("⚡ [failover] fast-path already bypassed deadNode=%u\n",
+            (unsigned)deadNodeIndex);
+        std::fflush(stdout);
+        return true;
+    }
     const NnUint prev = getPpPrevStageIndex(plan, stageIndex);
     const NnUint next = getPpNextStageIndex(plan, stageIndex);
     if (prev == (NnUint)-1 && next == (NnUint)-1) {
+        if (g_armedTakeover.armed && myNodeIndex == g_armedTakeover.ownerNode)
+            enableArmedTakeoverLayers(replayActivation);
         std::printf("⚡ [failover] fast-path already bypassed deadNode=%u stage=%u\n",
             (unsigned)deadNodeIndex, (unsigned)stageIndex);
         std::fflush(stdout);
@@ -5753,61 +5779,33 @@ static bool failoverBypassDeadNode(NnUnevenPartitionPlan *plan, NnUint myNodeInd
     for (NnUint s = 0; s < plan->nStages; ++s) nLayers = std::max(nLayers, plan->stages[s].endLayer);
     const RuntimeStageLayerPlan roles = buildRuntimeStageLayerPlan(plan, nLayers);
     const NnStageConfig &dead = plan->stages[stageIndex];
-    NnUint target = (NnUint)-1;
-    // The previous stage's shadow KV is computed from its own stage-output cache,
-    // which is the real input of the dead layers. The next stage only ever sees
-    // the dead stage's output, so its left-boundary KV cannot stand in.
-    if (ppStageCoversLayers(roles, prev, dead.startLayer, dead.endLayer)) target = prev;
-    else if (ppStageCoversLayers(roles, next, dead.startLayer, dead.endLayer)) target = next;
-    NnUint bilateralSplit = 0u;
-    const bool bilateral = target == (NnUint)-1 &&
-        ppBilateralSplit(roles, prev, next, dead.startLayer, dead.endLayer, &bilateralSplit);
-    if (target == (NnUint)-1 && !bilateral) {
+    // Only the previous stage's shadow KV is the dead layer's real input.
+    // The next stage's left-boundary cache is the dead stage's output.
+    if (!ppStageCoversLayers(roles, prev, dead.startLayer, dead.endLayer)) {
         std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u layers=[%u,%u) reason=partial-cover\n",
             (unsigned)deadNodeIndex, (unsigned)stageIndex, (unsigned)dead.startLayer, (unsigned)dead.endLayer);
         std::fflush(stdout);
         return false;
     }
-    if (bilateral) target = prev;
+    const NnUint target = prev;
+    const NnUint ownerNode = plan->stages[target].rootNodeIndex;
+    g_armedTakeover.armed = true;
+    g_armedTakeover.ownerNode = ownerNode;
+    g_armedTakeover.begin = dead.startLayer;
+    g_armedTakeover.end = dead.endLayer;
     if (!applyPpStageBypass(plan, stageIndex, target)) {
+        g_armedTakeover.armed = false;
         std::printf("⚡ [failover] fast-path reject deadNode=%u stage=%u reason=bypass-rejected\n",
             (unsigned)deadNodeIndex, (unsigned)stageIndex);
         std::fflush(stdout);
         return false;
     }
-    if (bilateral) {
-        const NnUint nextNode = plan->stages[next].rootNodeIndex;
-        if (g_failoverExecutor != nullptr && myNodeIndex == plan->stages[prev].rootNodeIndex) {
-            for (NnUint layer = dead.startLayer; layer < bilateralSplit; ++layer) {
-                g_failoverExecutor->setRedundantLayerEnabled(layer, true);
-            }
-            g_failoverExecutor->spliceRedundantLayersIntoSend(dead.startLayer, bilateralSplit);
-        }
-        if (g_failoverExecutor != nullptr && myNodeIndex == nextNode) {
-            // Suffix segments read the PP activation from X and write it back.
-            // Recv retries after this hook, then the rest of this forward runs them.
-            for (NnUint layer = bilateralSplit; layer < dead.endLayer; ++layer) {
-                g_failoverExecutor->setRedundantLayerEnabled(layer, true);
-            }
-        }
-        std::printf("⚡ [failover] fast-path bilateral deadNode=%u ejectedStage=%u split=%u prefix=[%u,%u) suffix=[%u,%u) myNode=%u\n",
-            (unsigned)deadNodeIndex, (unsigned)stageIndex, (unsigned)bilateralSplit,
-            (unsigned)dead.startLayer, (unsigned)bilateralSplit,
-            (unsigned)bilateralSplit, (unsigned)dead.endLayer, (unsigned)myNodeIndex);
-        std::fflush(stdout);
-        return true;
-    }
-    if (g_failoverExecutor != nullptr && myNodeIndex == plan->stages[target].rootNodeIndex) {
-        for (NnUint layer = dead.startLayer; layer < dead.endLayer; ++layer) {
-            g_failoverExecutor->setRedundantLayerEnabled(layer, true);
-        }
-        if (target == prev) {
-            g_failoverExecutor->spliceRedundantLayersIntoSend(dead.startLayer, dead.endLayer);
-        }
-    }
-    std::printf("⚡ [failover] fast-path deadNode=%u ejectedStage=%u targetStage=%u layers=[%u,%u) myNode=%u\n",
+    if (myNodeIndex == ownerNode)
+        enableArmedTakeoverLayers(replayActivation);
+    std::printf("⚡ [failover] fast-path deadNode=%u ejectedStage=%u targetStage=%u layers=[%u,%u) myNode=%u replay=%d\n",
         (unsigned)deadNodeIndex, (unsigned)stageIndex, (unsigned)target,
-        (unsigned)dead.startLayer, (unsigned)dead.endLayer, (unsigned)myNodeIndex);
+        (unsigned)dead.startLayer, (unsigned)dead.endLayer, (unsigned)myNodeIndex,
+        replayActivation ? 1 : 0);
     std::fflush(stdout);
     return true;
 }
@@ -6282,13 +6280,17 @@ static void runInferenceAppBody(AppCliArgs *args, void (*handler)(AppInferenceCo
     dllamaIoProbeFlush("root-inference");
 }
 
-static void sendJoinPacket(NnNetwork *network, NnUint socketIndex, const LlmDeviceJoinPacket &pkt) {
+static void writeJoinPacket(NnNetwork *network, NnUint socketIndex, const LlmDeviceJoinPacket &pkt) {
     LlmControlPacket ctrl{};
     ctrl.position = 0u;
     ctrl.batchSize = 1u;
     ctrl.flags = LLM_CTRL_DEVICE_JOIN | LLM_CTRL_CONTROL_ONLY;
     network->write(socketIndex, &ctrl, sizeof(ctrl));
     network->write(socketIndex, &pkt, sizeof(pkt));
+}
+
+static void sendJoinPacket(NnNetwork *network, NnUint socketIndex, const LlmDeviceJoinPacket &pkt) {
+    writeJoinPacket(network, socketIndex, pkt);
     network->readAck(socketIndex);
 }
 
@@ -6305,13 +6307,28 @@ void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
 
     NnNetwork *network = context->network;
     const NnUint nWorkers = context->args->nWorkers;
-    NnUint onlineMask = 1u << workerIndex;
-    for (NnUint i = 0; i < nWorkers; ++i) {
+    NnUint onlineMask = (workerIndex < 32u) ? (1u << workerIndex) : 0u;
+    for (NnUint i = 0; i < nWorkers && i < 32u; ++i) {
         if (i < g_poolLive.size() - 1u && g_poolLive[i + 1u] != 0) onlineMask |= (1u << i);
     }
     std::printf("🧩 [pool] joining %s:%d at pos=%u layers=[%u,%u)\n",
         host, port, (unsigned)position, (unsigned)g_reserved.layerBegin, (unsigned)g_reserved.layerEnd);
     std::fflush(stdout);
+
+    LlmDeviceJoinPacket accept{};
+    accept.magic = LLM_DEVICE_JOIN_MAGIC;
+    accept.version = LLM_DEVICE_JOIN_VERSION;
+    accept.op = LLM_DEVICE_JOIN_ACCEPT;
+    accept.workerIndex = workerIndex;
+    accept.peerPort = (NnUint)port;
+    std::snprintf(accept.peerHost, sizeof(accept.peerHost), "%s", host);
+    std::vector<NnUint> acceptSockets;
+    for (NnUint i = 0; i < nWorkers && i < 32u; ++i) {
+        if ((onlineMask & (1u << i)) == 0u || i == workerIndex) continue;
+        if (!network->isSocketActive(i)) continue;
+        writeJoinPacket(network, i, accept);
+        acceptSockets.push_back(i);
+    }
 
     bool connected = false;
     for (int attempt = 0; attempt < 8 && !connected; ++attempt) {
@@ -6323,23 +6340,12 @@ void maybeJoinReservedDevice(AppInferenceContext *context, NnUint position) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
     }
+    for (NnUint socketIndex : acceptSockets) network->readAck(socketIndex);
     if (!connected) {
         std::printf("⚠️  [pool] connect failed for worker %u\n", (unsigned)workerIndex);
         std::fflush(stdout);
         g_reserved.joined = true;
         return;
-    }
-
-    LlmDeviceJoinPacket accept{};
-    accept.magic = LLM_DEVICE_JOIN_MAGIC;
-    accept.version = LLM_DEVICE_JOIN_VERSION;
-    accept.op = LLM_DEVICE_JOIN_ACCEPT;
-    accept.workerIndex = workerIndex;
-    accept.peerPort = (NnUint)port;
-    for (NnUint i = 0; i < nWorkers; ++i) {
-        if ((onlineMask & (1u << i)) == 0u || i == workerIndex) continue;
-        if (!network->isSocketActive(i)) continue;
-        sendJoinPacket(network, i, accept);
     }
 
     g_writeJoinFields = true;

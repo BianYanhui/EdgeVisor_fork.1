@@ -434,10 +434,11 @@ static bool isOfflineErrno(int err) {
     case ECONNREFUSED:
         return true;
     case ETIMEDOUT:
-        // Our own poll deadline uses ETIMEDOUT with DLLAMA_IO_TIMEOUT_MS set.
-        // A keepalive / TCP_USER_TIMEOUT failure shows up here only while that
-        // inference deadline is disabled, which is the offline signal.
-        return getIoTimeoutMs() == 0ul;
+        // Keepalive and TCP_USER_TIMEOUT report ETIMEDOUT and do not send RST.
+        // That is a dead peer whether or not DLLAMA_IO_TIMEOUT_MS is set.
+        // The inference poll deadline throws NnTransferSocketException directly
+        // and does not pass through this classifier.
+        return true;
     default:
         return false;
     }
@@ -1776,15 +1777,15 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                         continue;
                     }
                     if (isOfflineErrno(SOCKET_LAST_ERRCODE)) {
-                        deactivateNode(peerNodeBySocket[io->socketIndex], 0u);
-                        io->size = 0;
-                        continue;
+                        const NnUint peer = peerNodeBySocket[io->socketIndex];
+                        deactivateNode(peer, 0u);
+                        throw NnPeerOfflineException(peer, "Socket write failed");
                     }
                     throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
                 } else if (s == 0) {
-                    deactivateNode(peerNodeBySocket[io->socketIndex], 0u);
-                    io->size = 0;
-                    continue;
+                    const NnUint peer = peerNodeBySocket[io->socketIndex];
+                    deactivateNode(peer, 0u);
+                    throw NnPeerOfflineException(peer, "Socket closed");
                 }
                 if (ioProfile) dllamaIoProbeRecordNetSendSyscall(dllamaIoProbeNowUs() - syscallStartUs, (std::uint64_t)s);
                 recordCommSend((NnSize)s);
@@ -2082,11 +2083,13 @@ bool NnNetwork::recoverPpIfNextOffline(const NnUnevenPartitionPlan *plan, NnUint
     const NnUint nextNode = plan->stages[nextStageIndex].rootNodeIndex;
     if (!peerLooksOffline(nextNode)) return false;
     NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
-    if (!g_ppFailover(mutablePlan, myNodeIndex, nextNode)) return false;
-    sendPpToNext(this, myNodeIndex, pipe, nBytes, plan);
-    std::printf("🔁 [failover] resent pp activation deadNext=%u bytes=%zu\n",
-        (unsigned)nextNode, (size_t)nBytes);
+    // This pipe is the token that already completed. Replaying it makes the next
+    // stage sample that token again and shifts every later position.
+    if (!g_ppFailover(mutablePlan, myNodeIndex, nextNode, false)) return false;
+    std::printf("🔁 [failover] armed bypass deadNext=%u; holding activation\n",
+        (unsigned)nextNode);
     std::fflush(stdout);
+    (void)nBytes;
     return true;
 }
 
@@ -2731,7 +2734,7 @@ static void syncPpSend(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, N
         sendPpToNext(network, myNodeIndex, buffer, nBytes, plan);
     } catch (const NnPeerOfflineException &offline) {
         NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
-        if (g_ppFailover == nullptr || !g_ppFailover(mutablePlan, myNodeIndex, offline.peerNodeIndex)) throw;
+        if (g_ppFailover == nullptr || !g_ppFailover(mutablePlan, myNodeIndex, offline.peerNodeIndex, true)) throw;
         sendPpToNext(network, myNodeIndex, buffer, nBytes, plan);
     }
 }
@@ -2742,7 +2745,7 @@ static void syncPpRecv(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, N
         recvPpFromPrev(network, myNodeIndex, buffer, nBytes, plan);
     } catch (const NnPeerOfflineException &offline) {
         NnUnevenPartitionPlan *mutablePlan = const_cast<NnUnevenPartitionPlan *>(plan);
-        if (g_ppFailover == nullptr || !g_ppFailover(mutablePlan, myNodeIndex, offline.peerNodeIndex)) throw;
+        if (g_ppFailover == nullptr || !g_ppFailover(mutablePlan, myNodeIndex, offline.peerNodeIndex, false)) throw;
         recvPpFromPrev(network, myNodeIndex, buffer, nBytes, plan);
     }
 }

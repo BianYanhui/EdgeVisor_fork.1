@@ -120,13 +120,13 @@ int main(int argc, char** argv) {
         NnUint remainingLayers = (NnUint)(header.nLayers - halfLayers);
 
         // --- Stage 0 ---
-        NnStageDef stage0;
+        NnStageDef stage0{};
         stage0.tpRatios = {1.0f};      // 显式赋值给 vector
         stage0.nLayers = halfLayers;   // 显式赋值给 uint
         stageDefs.push_back(stage0);
 
         // --- Stage 1 ---
-        NnStageDef stage1;
+        NnStageDef stage1{};
         stage1.tpRatios = {0.4f, 0.6f}; // 显式赋值给 vector
         stage1.nLayers = remainingLayers; // 显式赋值给 uint
         stageDefs.push_back(stage1);

@@ -54,9 +54,12 @@ typedef struct {
 // [新增] 用于 createPartitionPlan 的输入参数，描述一个 Stage 的需求
 struct NnStageDef {
     NnUint nLayers;              // 该 Stage 负责多少层
-    bool layersExplicit = false; // true when "@N" was written, including "@0"
     std::vector<float> tpRatios; // 该 Stage 内部的 TP 比例 (例如 {1.0, 3.0})
     std::vector<NnUint> kvRedundancyPerNode; // 每个节点的 KV 冗余 head 数量
+    // Trailing, with no default member initializer, so the struct stays a
+    // C++11 aggregate. Brace-init of the first three members value-initializes
+    // this to false. True when "@N" was written, including "@0".
+    bool layersExplicit;
 };
 
 // [新增] 描述一个 Stage 的具体配置 (生成后的结果)

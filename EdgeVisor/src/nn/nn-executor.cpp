@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <exception>
@@ -760,6 +761,7 @@ inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread 
 }
 
 static std::exception_ptr g_executorError;
+static std::atomic_flag g_executorErrorClaim = ATOMIC_FLAG_INIT;
 
 static inline void *executorThreadHandler(void *arg) {
     NnExecutorThread *thread = (NnExecutorThread *)arg;
@@ -777,7 +779,8 @@ static inline void *executorThreadHandler(void *arg) {
             executeStep(step, nThreads, thread, context);
         } catch (const std::runtime_error &e) {
             context->isAlive.store(false);
-            if (thread->threadIndex == 0u) g_executorError = std::current_exception();
+            if (!g_executorErrorClaim.test_and_set(std::memory_order_acq_rel))
+                g_executorError = std::current_exception();
             printf("Execution error: %s\n", e.what());
             break;
         }
@@ -842,6 +845,7 @@ static inline void *executorThreadHandler(void *arg) {
 
 void NnExecutor::forward() {
     g_executorError = nullptr;
+    g_executorErrorClaim.clear(std::memory_order_release);
     assert(netExecution->batchSize > 0);
 
     NnUint nThreads = netExecution->nThreads;
